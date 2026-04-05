@@ -55,29 +55,12 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // ── Singleton guard: prevent duplicate polling instances (409 Conflict) ──
 // Claude Code harness spawns both external_plugins/ and cache/ copies simultaneously.
 // Both call getUpdates on the same bot token → Telegram returns 409 Conflict.
-// Fix: use a lockfile so only the first instance runs; second exits immediately.
+// The cache/ copy handles the actual MCP connection; external_plugins/ must yield.
 // See: https://github.com/anthropics/claude-code/issues/36800
-const LOCK_FILE = join(STATE_DIR, '.telegram.lock')
-try {
-  const existingPid = parseInt(readFileSync(LOCK_FILE, 'utf8').trim(), 10)
-  if (existingPid && existingPid !== process.pid) {
-    try {
-      process.kill(existingPid, 0) // check if alive (throws if dead)
-      process.stderr.write(
-        `telegram channel: another instance running (PID=${existingPid}), exiting to avoid 409 Conflict\n`,
-      )
-      process.exit(0)
-    } catch {
-      // PID is dead, stale lockfile — we take over
-    }
-  }
-} catch {
-  // No lockfile — first instance
+if (process.argv[1] && realpathSync(process.argv[1]).includes(sep + 'external_plugins' + sep)) {
+  process.stderr.write('telegram channel: external_plugins copy detected, yielding to cache copy\n')
+  process.exit(0)
 }
-writeFileSync(LOCK_FILE, `${process.pid}\n`)
-process.on('exit', () => { try { rmSync(LOCK_FILE) } catch {} })
-process.on('SIGTERM', () => { try { rmSync(LOCK_FILE) } catch {}; process.exit(0) })
-process.on('SIGINT', () => { try { rmSync(LOCK_FILE) } catch {}; process.exit(0) })
 // ── End singleton guard ──
 
 // Last-resort safety net — without these the process dies silently on any
