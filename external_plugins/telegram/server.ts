@@ -53,26 +53,35 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
 // ── Singleton guard: prevent duplicate polling instances (409 Conflict) ──
-// Claude Code harness may spawn both external_plugins/ and cache/ copies simultaneously.
-// Both call getUpdates on the same bot token → Telegram returns 409 Conflict.
-// Fix: if this is the external_plugins copy AND a cache copy exists, yield.
-// If no cache copy exists (some servers), external_plugins runs normally.
+// Claude Code harness sometimes spawns multiple copies of this plugin.
+// Multiple copies calling getUpdates on the same bot token → 409 Conflict.
+// Fix: lockfile-based guard. First instance runs, subsequent ones exit.
 // See: https://github.com/anthropics/claude-code/issues/36800
-if (process.argv[1] && realpathSync(process.argv[1]).includes(sep + 'external_plugins' + sep)) {
-  // Check if a cache copy of this plugin exists
-  const cacheBase = join(homedir(), '.claude', 'plugins', 'cache')
-  let cacheExists = false
-  try {
-    for (const marketplace of readdirSync(cacheBase)) {
-      const telegramCache = join(cacheBase, marketplace, 'telegram')
-      try { if (statSync(telegramCache).isDirectory()) { cacheExists = true; break } } catch {}
+const LOCK_FILE = join(STATE_DIR, '.telegram.lock')
+try {
+  const lockContent = readFileSync(LOCK_FILE, 'utf8').trim()
+  const existingPid = parseInt(lockContent, 10)
+  if (existingPid && existingPid !== process.pid) {
+    try {
+      process.kill(existingPid, 0) // throws if process is dead
+      // Another instance is alive — we are the duplicate, exit
+      process.stderr.write(
+        `telegram channel: another instance running (PID=${existingPid}), exiting to avoid 409 Conflict\n`,
+      )
+      process.exit(0)
+    } catch {
+      // Existing PID is dead — stale lockfile, we take over
     }
-  } catch {}
-  if (cacheExists) {
-    process.stderr.write('telegram channel: cache copy exists, external_plugins yielding to avoid 409\n')
-    process.exit(0)
   }
+} catch {
+  // No lockfile or unreadable — we are the first instance
 }
+// Write our PID and clean up on exit
+writeFileSync(LOCK_FILE, `${process.pid}\n`)
+const _cleanLock = () => { try { rmSync(LOCK_FILE) } catch {} }
+process.on('exit', _cleanLock)
+process.on('SIGTERM', () => { _cleanLock(); process.exit(0) })
+process.on('SIGINT', () => { _cleanLock(); process.exit(0) })
 // ── End singleton guard ──
 
 // Last-resort safety net — without these the process dies silently on any
