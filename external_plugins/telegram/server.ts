@@ -53,13 +53,25 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
 // ── Singleton guard: prevent duplicate polling instances (409 Conflict) ──
-// Claude Code harness spawns both external_plugins/ and cache/ copies simultaneously.
+// Claude Code harness may spawn both external_plugins/ and cache/ copies simultaneously.
 // Both call getUpdates on the same bot token → Telegram returns 409 Conflict.
-// The cache/ copy handles the actual MCP connection; external_plugins/ must yield.
+// Fix: if this is the external_plugins copy AND a cache copy exists, yield.
+// If no cache copy exists (some servers), external_plugins runs normally.
 // See: https://github.com/anthropics/claude-code/issues/36800
 if (process.argv[1] && realpathSync(process.argv[1]).includes(sep + 'external_plugins' + sep)) {
-  process.stderr.write('telegram channel: external_plugins copy detected, yielding to cache copy\n')
-  process.exit(0)
+  // Check if a cache copy of this plugin exists
+  const cacheBase = join(homedir(), '.claude', 'plugins', 'cache')
+  let cacheExists = false
+  try {
+    for (const marketplace of readdirSync(cacheBase)) {
+      const telegramCache = join(cacheBase, marketplace, 'telegram')
+      try { if (statSync(telegramCache).isDirectory()) { cacheExists = true; break } } catch {}
+    }
+  } catch {}
+  if (cacheExists) {
+    process.stderr.write('telegram channel: cache copy exists, external_plugins yielding to avoid 409\n')
+    process.exit(0)
+  }
 }
 // ── End singleton guard ──
 
