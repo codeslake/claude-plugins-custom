@@ -115,10 +115,23 @@ type GroupPolicy = {
   allowFrom: string[]
 }
 
+// Policy for a Telegram channel used as bot-to-bot coordination bus.
+// Bots can post to the channel; other bots subscribed to the channel receive
+// those messages as channel_post updates (unlike groups, bots CAN see each
+// other's messages in channels).
+type ChannelPolicy = {
+  /** Require @botusername mention to deliver. Default: false (receive all posts). */
+  requireMention: boolean
+  /** Bot user IDs allowed to post. Empty array = accept from any bot. */
+  allowFrom: string[]
+}
+
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
   groups: Record<string, GroupPolicy>
+  /** Telegram channels used as bot-to-bot coordination buses. */
+  channels?: Record<string, ChannelPolicy>
   pending: Record<string, PendingEntry>
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
@@ -168,6 +181,7 @@ function readAccessFile(): Access {
       dmPolicy: parsed.dmPolicy ?? 'pairing',
       allowFrom: parsed.allowFrom ?? [],
       groups: parsed.groups ?? {},
+      channels: parsed.channels,
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
       ackReaction: parsed.ackReaction,
@@ -212,6 +226,7 @@ function assertAllowedChat(chat_id: string): void {
   const access = loadAccess()
   if (access.allowFrom.includes(chat_id)) return
   if (chat_id in access.groups) return
+  if (access.channels && chat_id in access.channels) return
   throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
 }
 
@@ -298,6 +313,52 @@ function gate(ctx: Context): GateResult {
   }
 
   return { action: 'drop' }
+}
+
+// Gate for Telegram channel posts (bot-to-bot coordination).
+// Bots cannot see each other's messages in groups, but CAN in channels.
+// Only bot senders are accepted; human channel posts are dropped.
+function gateChannelPost(ctx: Context): GateResult {
+  const access = loadAccess()
+  if (!access.channels) return { action: 'drop' }
+
+  const channelId = String(ctx.chat!.id)
+  const policy = access.channels[channelId]
+  if (!policy) return { action: 'drop' }
+
+  const from = ctx.channelPost?.from
+  if (!from || !from.is_bot) return { action: 'drop' } // only bot posts
+
+  const senderId = String(from.id)
+  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) {
+    return { action: 'drop' }
+  }
+
+  if (policy.requireMention && !isMentionedInChannelPost(ctx, access.mentionPatterns)) {
+    return { action: 'drop' }
+  }
+
+  return { action: 'deliver', access }
+}
+
+function isMentionedInChannelPost(ctx: Context, extraPatterns?: string[]): boolean {
+  const entities = ctx.channelPost?.entities ?? ctx.channelPost?.caption_entities ?? []
+  const text = ctx.channelPost?.text ?? ctx.channelPost?.caption ?? ''
+  for (const e of entities) {
+    if (e.type === 'mention') {
+      const mentioned = text.slice(e.offset, e.offset + e.length)
+      if (mentioned.toLowerCase() === `@${botUsername}`.toLowerCase()) return true
+    }
+    if (e.type === 'text_mention' && e.user?.is_bot && e.user.username === botUsername) {
+      return true
+    }
+  }
+  for (const pat of extraPatterns ?? []) {
+    try {
+      if (new RegExp(pat, 'i').test(text)) return true
+    } catch {}
+  }
+  return false
 }
 
 function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
@@ -788,6 +849,12 @@ bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
 
+// Telegram bots cannot see other bots' messages in groups, but CAN in channels.
+// channel_post events arrive when any bot posts to a channel this bot is admin of.
+bot.on('channel_post:text', async ctx => {
+  await handleChannelPost(ctx, ctx.channelPost.text)
+})
+
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
   // Defer download until after the gate approves — any user can send photos,
@@ -982,6 +1049,35 @@ async function handleInbound(
     },
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+}
+
+// Handle a Telegram channel post (bot-to-bot coordination).
+// Channel posts bypass the normal user gate — only bot senders from
+// channels listed in access.json's `channels` section are accepted.
+async function handleChannelPost(ctx: Context, text: string): Promise<void> {
+  const result = gateChannelPost(ctx)
+  if (result.action !== 'deliver') return
+
+  const from = ctx.channelPost!.from!
+  const chat_id = String(ctx.chat!.id)
+  const msgId = ctx.channelPost?.message_id
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: text,
+      meta: {
+        chat_id,
+        ...(msgId != null ? { message_id: String(msgId) } : {}),
+        user: from.username ?? String(from.id),
+        user_id: String(from.id),
+        ts: new Date((ctx.channelPost?.date ?? 0) * 1000).toISOString(),
+        is_channel_post: 'true',
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver channel post to Claude: ${err}\n`)
   })
 }
 
